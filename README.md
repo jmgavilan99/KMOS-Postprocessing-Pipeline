@@ -13,9 +13,9 @@ in the pipeline, followed by installation and usage instructions.
 
 | Step | Script | Purpose | Input | Output |
 |------|--------|---------|-------|--------|
-| 1 | `01_sky_subtraction.py` | Subtract sky from each OB cube using `kmos_sky_tweak` + `kmos_combine` | Reduced `SINGLE_CUBES_KMOS` cubes | Sky-subtracted cubes (`SKY_TWEAK` → combined) |
-| 2 | `02_auto_astrometry.py` | Automatic astrometric correction | | |
-| 3 | `03_manual_astrometry.py` | Manual (interactive) astrometric correction | | |
+| 1 | `01_sky_subtraction.py` | Sky subtraction and cube combination | Reduced `SINGLE_CUBES_KMOS` cubes (EsoReflex) | Sky-subtracted, combined cubes (`COMBINE_SKY_TWEAK_*.fits`) |
+| 2 | `02_auto_astrometry.py` | Automatic astrometric correction against a reference catalogue | `COMBINE_SKY_TWEAK_*.fits` + catalogue `.txt` | Astrometrically corrected cubes + diagnostic plots + summary CSV |
+| 3 | `03_manual_astrometry.py` | Manual (interactive) astrometric correction (fallback) | | |
 | 4 | `04_extract_spectra.py` | Extract 1D spectra | | |
 
 ---
@@ -111,3 +111,164 @@ OB1/
   cubes to avoid picking up previous outputs.
 - Any OB whose cube cannot be found is skipped with a printed error, so a
   partial run never aborts the whole loop.
+  
+---
+
+### 2. Automatic Astrometric Correction — `02_auto_astrometry.py`
+
+Automatically corrects the astrometry of each sky-subtracted IFU cube by matching
+stars detected in the cube against a reference catalogue (e.g. GNUCLEUS / GNS).
+The script estimates the (dRA, dDec) offset between the IFU detections and the
+catalogue, updates the WCS of the cube, and writes a corrected copy together with
+diagnostic plots and a per-OB summary.
+
+**What the script does**
+
+1. For a given pointing and a list of OBs, it reads every `COMBINE_SKY_TWEAK_*.fits`
+   cube from each `sky_tweak/` folder (created in the last step).
+
+2. For each IFU cube it:
+
+   - Reads the header reference coordinate (`CRVAL1`, `CRVAL2`) and selects a local
+     catalogue region within a configurable radius in arcsec 
+     (`CATALOGUE_SEARCH_RADIUS_ARCSEC`) and brighter than `REFERENCE_K_LIMIT` in Vega     magnitudes.
+
+   - Collapses the 3D cube (λ, y, x) into a 2D image (y, x) by integrating
+     over the spectral axis. Three operations are applied:
+
+       1. **Edge trimming.** The first and last `EDGE_TRIM_FRACTION` of the
+          spectral channels are discarded, since the bluest and reddest
+          channels are the noisiest (low atmospheric transmission, low
+          detector response, residual sky). With `EDGE_TRIM_FRACTION = 0.08`
+          and ~2000 channels, ~160 channels are removed at each end.
+
+       2. **Sigma clipping.** For each spatial pixel, the remaining spectrum
+          is sigma-clipped at `sigma = 2` to reject cosmic rays, hot pixels,
+          bad calibration channels and residual OH lines, all of which could
+          bias the subsequent source detection. Negative values are masked
+          as well.
+
+       3. **Integration over wavelength.** The cleaned spectrum of each
+          spatial pixel is integrated over the wavelength axis:
+
+              F(y, x) = ∫ f(y, x, λ) dλ
+
+          where `f(y, x, λ)` is the sigma-clipped spectrum of pixel `(y, x)`
+          and the integral runs over the retained spectral channels (in Å).
+          The resulting image value is therefore proportional to the
+          integrated flux of that pixel, not just a raw sum of counts.
+
+     The output is a 2D image (`image_clean`) with the same celestial WCS as
+     the cube, ready for source detection.
+
+   - Estimates the PSF FWHM in arcsec from several header keywords
+     (`SKY_RES`, `IA FWHM`, `AMBI FWHM`, …) and detects stars with
+     `DAOStarFinder` using `KARMA_THRESHOLD_SIGMA` and
+     `KARMA_MIN_SEPARATION_ARCSEC`.
+
+   - Removes detections too close to the image borders
+     (`EDGE_EXCLUSION_PIXELS`) to avoid spurious sources.
+
+3. For each detected anchor star, the script:
+
+   - Builds an ordered list of candidate catalogue counterparts
+     (`build_anchor_trial_order`): first the brightest nearby stars within
+     `BRIGHT_ANCHOR_MAG_RANGE` mag of the brightest local catalogue star, then
+     the remaining catalogue stars by K magnitude.
+
+   - Computes the (dRA, dDec) shift needed to place the anchor onto each candidate.
+
+   - Rejects shifts larger than `MAX_TOTAL_SHIFT_ARCSEC`.
+
+   - Evaluates the shift with mutual nearest-neighbour matching
+     (`evaluate_shift_candidate`):
+     - requires the brightest IFU star to be matched,
+     - requires at least `MIN_NMATCH` matches and a match fraction of
+       `MIN_MATCH_FRACTION`,
+     - enforces a photometric consistency check on the brightest KMOS source,
+     - enforces a global flux–magnitude ordering with `FLUX_TOLERANCE_RATIO`.
+
+4. It compares the best shifted solution against the original (zero-shift) WCS
+   and keeps the original unless the shift gives a meaningful improvement
+   (`MIN_RMS_IMPROVEMENT_ARCSEC`).
+
+5. If a valid solution is found, it:
+
+   - Updates `CRVAL1`/`CRVAL2` in the cube and in the collapsed image and saves
+     corrected copies,
+   - writes a final check plot showing the corrected detections over the catalogue,
+   - appends a row to the per-OB `astrometry_summary.csv`.
+
+**Configuration and USER Parameters**
+
+
+**Key configuration parameters (top of the script)**
+
+| Variable | Meaning |
+|----------|---------|
+| `pointing` | Pointing name (e.g. `"P6"`) |
+| `OBS` | List of OBs to process (e.g. `["OB1", "OB2", …]`) |
+| `GNS_TXT_PATH` | Path to the reference catalogue `.txt` |
+| `BASE_DIR_TEMPLATE` | Template path to the `sky_tweak/` folder of each OB |
+| `INPUT_PATTERN` | Glob pattern for the input cubes (default `"COMBINE_SKY_TWEAK_*.fits"`) |
+| `CATALOGUE_SEARCH_RADIUS_ARCSEC` | Radius around the IFU reference position for the catalogue cut |
+| `REFERENCE_K_LIMIT` | Maximum K magnitude of catalogue stars used |
+| `EDGE_TRIM_FRACTION` | Fraction of spectral channels removed at each edge before collapsing |
+| `KARMA_THRESHOLD_SIGMA` | Detection threshold in sigma for `DAOStarFinder` |
+| `KARMA_MIN_SEPARATION_ARCSEC` | Minimum separation between detections |
+| `MATCH_RADIUS_ARCSEC` | Radius for one-to-one star matching after a trial shift |
+| `MAX_TOTAL_SHIFT_ARCSEC` | Maximum total astrometric shift allowed |
+| `MIN_NMATCH` | Minimum number of matched stars for a multi-star solution |
+| `MIN_MATCH_FRACTION` | Minimum fraction of detected IFU stars that must be matched |
+| `FLUX_TOLERANCE_RATIO` | Brightness-ordering consistency tolerance |
+| `BRIGHT_ANCHOR_MAG_RANGE` | First-try catalogue anchors within this range of the brightest local star |
+| `EDGE_EXCLUSION_PIXELS` | Detections closer than this to the border are discarded |
+| `brightest_k_tolerance_mag` | Tolerance for brightest-source photometric consistency |
+| `MIN_RMS_IMPROVEMENT_ARCSEC` | Minimum RMS improvement over zero-shift to accept a shift |
+
+
+**Input**
+
+The script expects the output of step 1, i.e. for each OB:
+
+```
+<BASE_DIR_TEMPLATE>/
+└── <pointing>/
+└── end_products/
+└── <OB>/
+└── sky_tweak/
+└── COMBINE_SKY_TWEAK_*.fits
+```
+
+It also needs a plain-text reference catalogue with columns
+`ra dec J dJ H dH K dK` (e.g. the GNUCLEUS NSD or Bulge list).
+
+**Output**
+
+For each OB, results are written under `res_<OB>/`:
+
+```
+res_<OB>/
+├── <OB>_collapsed_new/ # Collapsed images (with WCS) for each cube
+├── corrected_fits_new/
+│ ├── <cube>_astrocorr.fits # Corrected cube (shifted CRVAL1/CRVAL2)
+│ ├── collapsed/ # Corrected collapsed images
+│ ├── visual_checks/ # Accepted-solution overlays
+│ ├── diagnostic_plots/ # Initial overlay, best trial, trial summary
+│ ├── final_check_plots/ # Final verification plots
+│ └── astrometry_summary.csv # One row per processed IFU
+```
+
+**Notes / caveats**
+
+- The script assumes one cube per FITS file, with science data in extension 1.
+- The PSF FWHM is estimated from headers; if no valid indicator is found within
+  `[0.2, 3.0]` arcsec the script raises an error and skips the IFU.
+- A zero-shift solution is always evaluated first and is kept unless the shifted
+  solution improves the RMS by more than `MIN_RMS_IMPROVEMENT_ARCSEC`.
+- All accepted and rejected trials are logged in
+  `diagnostic_plots/<cube>_trial_summary.csv` and as a plot, useful for
+  debugging when the automatic solution fails (see step 3 for the manual fallback).
+- The script uses `os.chdir()`-free path handling (`pathlib`), so it is safe to
+  run from any working directory.
+
