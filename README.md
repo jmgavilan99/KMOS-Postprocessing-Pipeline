@@ -67,15 +67,14 @@ recipe `kmos_sky_tweak`, then combines the resulting tweaked cubes with
         
 **Input**
 
-   <base_path>/
-   ├── con1/
-   │   ├── Sky/   -> reduced sky cube (EsoReflex, dark cloud ~20' away)
-   │   ├── OB1/   -> reduced science cube (EsoReflex)
-   │   └── OB2/   -> ...
-   └── con2/ ...
+<base_path>/
+├── con1/
+│   ├── Sky/   -> reduced sky cube (EsoReflex, dark cloud ~20' away)
+│   ├── OB1/   -> reduced science cube (EsoReflex)
+│   └── OB2/   -> ...
+└── con2/ ...
 
- Each *SINGLE_CUBES_KMOS*.fits file must live inside:
- <folder>/<date>/KMOS.*_tpl/
+ Each *SINGLE_CUBES_KMOS*.fits file must live inside: <folder>/<date>/KMOS.*_tpl/`
 
 **Output**
 
