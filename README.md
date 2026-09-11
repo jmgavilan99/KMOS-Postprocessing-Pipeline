@@ -347,6 +347,7 @@ identified later without re-running the interactive session.
 
 **Output**
 
+```
 For each OB, results are written under `res_<OB>/`:
 res_<OB>/
 └── corrected_fits_new/
@@ -356,7 +357,7 @@ res_<OB>/
     │   └── COLLAPSED<cube>_astrocorr.fits
     └── visual_checks/
         └── <cube>_accepted_solution.png
-
+```
 
 **Notes / caveats**
 
