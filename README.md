@@ -207,8 +207,7 @@ diagnostic plots and a per-OB summary.
 |----------|---------|
 | `pointing` | Pointing name (e.g. `"P6"`) |
 | `OBS` | List of OBs to process (e.g. `["OB1", "OB2", …]`) |
-| `GNS_TXT_PATH` | Path to the reference catalogue `.txt` with columns
-`ra dec J dJ H dH K dK` |
+| `GNS_TXT_PATH` | Path to the reference catalogue `.txt` with columns `ra dec J dJ H dH K dK` |
 | `BASE_DIR_TEMPLATE` | Path template that defines where the cubes of each OB live. It contains the placeholders `{pointing}` and `{ob_name}`, which the script replaces for each combination of `pointing` and each entry of `OBS`. Example: `"/home/{pointing}/{con_name}/{ob_name}/sky_tweak/"`. |
 | `INPUT_PATTERN` | Glob pattern for the input cubes (default `"COMBINE_SKY_TWEAK_*.fits"`) |
 | `CATALOGUE_SEARCH_RADIUS_ARCSEC` | Radius around the IFU reference position for the catalogue cut |
@@ -307,10 +306,7 @@ step 2 failed to solve in the first place.
 - Selects a local catalogue region around the reference coordinate
   (`CRVAL1`, `CRVAL2`) within `CATALOGUE_RADIUS_ARCSEC` and brighter than
   `REFERENCE_K_LIMIT`.
-- Builds a collapsed image with `np.nanmedian` along the spectral axis.
-  This is intentionally simpler than the collapse used in step 2 (no edge
-  trimming, no sigma-clip), because the user is going to inspect the image
-  visually and can ignore residual artefacts by eye.
+- Builds a collapsed image.
 - Opens an interactive Matplotlib window showing the collapsed IFU image
   with the local catalogue stars overlaid and labelled by `index:K`
   magnitude.
@@ -335,7 +331,49 @@ step 2 failed to solve in the first place.
 `<cube>_manual_rejected.txt` and moves on, so rejected IFUs can be
 identified later without re-running the interactive session.
 
-**Input**
 
-Same tree as step 2. The script only reads the cubes that are still
-uncorrected:
+**Configuration and User Parameters**
+
+| Variable | Meaning |
+|----------|---------|
+| `pointing` | Pointing name (e.g. `"P6"`) |
+| `OBS` | List of OBs to process (e.g. `["OB1", "OB2", …]`) |
+| `INPUT_PATTERN` | Glob pattern for the input cubes (default `"COMBINE_SKY_TWEAK_*.fits"`) |
+| `catalogue_file` | Path to the reference catalogue `.txt` |
+| `CATALOGUE_RADIUS_ARCSEC` | Radius around the IFU reference position for the catalogue cut |
+| `REFERENCE_K_LIMIT` | Maximum K magnitude of catalogue stars used |
+| `BASE_DIR_TEMPLATE` | Path template that defines where the cubes of each OB live. Contains `{pointing}` and `{ob_name}` placeholders, resolved for each combination of `pointing` and each entry of `OBS`. Example: `"/home/data/KMOS/PILOT/reduced/P113/{pointing}/{ob_name}/sky_tweak"` → for `pointing = "P6"` and `ob_name = "OB1"` it resolves to `"/home/data/KMOS/PILOT/reduced/P113/P6/OB1/sky_tweak"`. |
+
+
+**Output**
+
+For each OB, results are written under `res_<OB>/`:
+res_<OB>/
+└── corrected_fits_new/
+    ├── <cube>_astrocorr.fits # Manually corrected cube
+    ├── <cube>manual_rejected.txt # Only if the IFU was rejected
+    ├── collapsed/
+    │   └── COLLAPSED<cube>_astrocorr.fits
+    └── visual_checks/
+        └── <cube>_accepted_solution.png
+
+
+**Notes / caveats**
+
+- The script is designed to be run **after** step 2 and after reviewing the
+  `final_check_plots/` folder. It only touches IFUs without a
+  `*_astrocorr.fits`, so re-running it is safe and does not overwrite good
+  automatic solutions.
+- The collapse uses `np.nanmedian` (no sigma-clip, no edge trim) because the
+  user is expected to visually identify the correct star pair. If the sky
+  residuals are strong, this can bias the visual position of faint stars.
+- If the user closes the window without completing the two clicks, the IFU is
+  skipped and no output is written. Only an explicit right-click triggers the
+  rejection marker file.
+- Rejected IFUs are flagged with `*_manual_rejected.txt`. Subsequent runs will
+  still try to process them, since they do not have an `*_astrocorr.fits`
+  file. If you want to skip them permanently, exclude them manually or remove
+  the corresponding input cube from the folder.
+- No automatic photometric consistency check is performed, so the match
+  quality depends entirely on the user's selection. The saved
+  `*_manual_check.png` is the only record of the manual decision.
