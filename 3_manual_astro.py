@@ -37,6 +37,7 @@ Notes
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import re
 import warnings
 from pathlib import Path
 from typing import Optional
@@ -44,18 +45,19 @@ from typing import Optional
 import astropy.units as u
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
+from astropy.stats import sigma_clip
 from astropy.wcs import WCS
 
 # ============================================================
 # CONFIGURATION – Edit only these variables
 # ============================================================
 pointing = "PX"                     # pointing name
-CONS = ["conx"]     # concatenations to process
+CONS = ["con3"]     # concatenations to process
 
 INPUT_PATTERN = "COMBINE_SKY_TWEAK_*.fits"
 
 # Catalogue path (adjust to your real path)
-catalogue_file =  Path("/home/data/KMOS/PILOT/GNS_cat/FINAL_EAST_CENTRAL_WEST_VIRAC.fits")
+catalogue_file =  Path("/home/jmgavilan/Desktop/KMOS/GNS_VIRAC_cat/FINAL_EAST_CENTRAL_WEST_VIRAC.fits")
 
 # Reduced search radius so that the IFU fills more of the field
 CATALOGUE_RADIUS_ARCSEC = 5.0
@@ -65,12 +67,59 @@ REFERENCE_K_LIMIT = 14.5
 # Must match the automatic pipeline structure.
 BASE_DIR_TEMPLATE = (
     # "/home/data/KMOS/PILOT/reduced/P113/{pointing}/{con_name}/{ob_name}/sky_tweak/" # Server Path
-    "/home/jmgavilan/Desktop/PX/{pointing}/{con_name}/OBX/sky_tweak/"     # Local test
+    "/home/jmgavilan/Desktop/PX/{pointing}/{con_name}/{ob_name}/sky_tweak/"  # Local test     # Local test
 )
 
 # "/home/data/KMOS/PILOT/reduced/P113/{pointing}/{con_name}/{ob_name}/sky_tweak/" # Server Path
 
 BASE_DIR = None   # will be updated for each OB
+
+# ============================================================
+# GET ARM NUMBER
+# ============================================================
+def get_arm_label(hdr, fits_name: str) -> str:
+    """
+    Return a short ARM label like 'ARM1' for the plot title.
+
+    Strategy
+    --------
+    1. Search the header KEYS for a token matching 'ARM<digits>'
+       (this is the original user method, e.g. 'HIERARCH ESO INS ARM1 ...').
+    2. Search the VALUES of the standard KMOS keywords
+       ('ARM', 'ESO INS OPTI3 NAME', HIERARCH variant).
+    3. Search ALL header VALUES for the same pattern.
+    4. Search the file name for a token like 'ARM1'.
+    5. Fall back to 'ARM?' so the title never breaks.
+    """
+    pattern = re.compile(r"ARM(\d+)", re.IGNORECASE)
+
+    # 1) Header keys (original user method)
+    for key in hdr:
+        m = pattern.search(key)
+        if m:
+            return f"ARM{m.group(1)}"
+
+    # 2) Standard KMOS keyword values
+    for key in ("ARM", "ESO INS OPTI3 NAME", "HIERARCH ESO INS OPTI3 NAME"):
+        if key in hdr:
+            m = pattern.search(str(hdr[key]))
+            if m:
+                return f"ARM{m.group(1)}"
+
+    # 3) Any header value
+    for key in hdr:
+        m = pattern.search(str(hdr[key]))
+        if m:
+            return f"ARM{m.group(1)}"
+
+    # 4) File name
+    m = pattern.search(Path(fits_name).stem)
+    if m:
+        return f"ARM{m.group(1)}"
+
+    # 5) Fallback
+    return "ARM?"
+
 
 # ============================================================
 # PATH HANDLING
@@ -216,8 +265,42 @@ def select_local_catalogue(df_cat: pd.DataFrame, ref_coord: SkyCoord) -> pd.Data
 # ============================================================
 # CUBE COLLAPSE
 # ============================================================
-def collapse_cube(cube: np.ndarray) -> np.ndarray:
-    return np.nanmedian(cube, axis=0)
+def collapse_cube(
+    cube: np.ndarray,
+    wcs_spectral: WCS,
+    edge_trim_fraction: float = 0.08,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Collapse the cube by trimming spectral edges and applying sigma-clip,
+    exactly like the automatic pipeline. This makes the image scale
+    (and therefore the colorbar) consistent between both scripts.
+    """
+    nz = cube.shape[0]
+    trim = int(np.floor(edge_trim_fraction * nz))
+    i0, i1 = trim, nz - trim
+    if i1 <= i0 + 5:
+        raise ValueError("Too many spectral channels removed by EDGE_TRIM_FRACTION.")
+
+    wave_idx = np.arange(i0, i1)
+    lambda_m = wcs_spectral.pixel_to_world(wave_idx)
+    lambda_angstrom = lambda_m.to(u.AA)
+
+    subcube = cube[i0:i1, :, :]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        clipped = sigma_clip(subcube, sigma=2, axis=0)
+
+    masked_cube = np.ma.masked_where(
+        clipped.mask | (clipped.data < 0),
+        clipped.data
+    )
+    image = np.trapezoid(
+        masked_cube,
+        x=lambda_angstrom.value,
+        axis=0
+    ).filled(0)
+
+    return image, wave_idx
 
 
 # ============================================================
@@ -271,12 +354,13 @@ def save_manual_check_plot(
     clicked_cat: tuple[float, float],
     matched_index: int,
     output_path: Path,
+    title_info: str = "",
 ) -> None:
     fig = plt.figure(figsize=(8, 6))
     ax = plt.subplot(projection=wcs)
     finite = image[np.isfinite(image)]
     if finite.size > 0:
-        vmin, vmax = np.nanpercentile(finite, [5, 99])
+        vmin, vmax = np.nanpercentile(finite, [5, 99.5])
     else:
         vmin, vmax = None, None
     im = ax.imshow(image, origin="lower", cmap="hot", vmin=vmin, vmax=vmax)
@@ -298,7 +382,11 @@ def save_manual_check_plot(
     ax.plot(clicked_ifu[0], clicked_ifu[1], "ro", ms=8, label="Selected IFU star")
     ax.plot(clicked_cat[0], clicked_cat[1], "go", ms=8, label="Catalogue click")
     ax.plot(x_cat[matched_index], y_cat[matched_index], "gs", ms=8, label="Matched catalogue star")
-    ax.set_title("Manual astrometry check")
+    base_title = "Manual astrometry check"
+    if title_info:
+        ax.set_title(f"{title_info}\n{base_title}")
+    else:
+        ax.set_title(base_title)
     ax.legend(loc="upper right", fontsize=8)
     plt.tight_layout()
     plt.savefig(output_path, dpi=180, bbox_inches="tight")
@@ -309,10 +397,11 @@ def save_manual_check_plot(
 # INTERACTIVE MATCHER (unchanged)
 # ============================================================
 class InteractiveMatcher:
-    def __init__(self, image: np.ndarray, wcs: WCS, df_cat: pd.DataFrame):
+    def __init__(self, image: np.ndarray, wcs: WCS, df_cat: pd.DataFrame, title_info: str = ""):
         self.image = image
         self.wcs = wcs
         self.df_cat = df_cat
+        self.title_info = title_info
         self.clicked_ifu = None
         self.clicked_cat = None
         self.rejected = False
@@ -324,7 +413,7 @@ class InteractiveMatcher:
     def plot_base(self):
         finite = self.image[np.isfinite(self.image)]
         if finite.size > 0:
-            vmin, vmax = np.nanpercentile(finite, [5, 99])
+            vmin, vmax = np.nanpercentile(finite, [5, 99.5])
         else:
             vmin, vmax = None, None
         im = self.ax.imshow(self.image, origin="lower", cmap="hot", vmin=vmin, vmax=vmax)
@@ -343,10 +432,11 @@ class InteractiveMatcher:
                 fontsize=9,
                 bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.6)
             )
-        self.ax.set_title(
-            "Left click: IFU star, then catalogue star | Right click: reject IFU",
-            fontsize=11
-        )
+        base_title = "Left click: IFU star, then catalogue star | Right click: reject IFU"
+        if self.title_info:
+            self.ax.set_title(f"{self.title_info}\n{base_title}", fontsize=11)
+        else:
+            self.ax.set_title(base_title, fontsize=11)
 
     def onclick(self, event):
         if event.inaxes != self.ax:
@@ -459,7 +549,11 @@ def main():
                     cube = hdul[1].data
                     hdr = hdul[1].header
                     wcs = WCS(hdr).celestial
-
+                    
+                    wcs_spectral = WCS(hdr).sub(["spectral"])
+                    arm_label = get_arm_label(hdr, fits_file.name)
+                    corrected_filename = f"{fits_file.stem}_astrocorr.fits"
+                    title_info = f"{corrected_filename} | {arm_label}"                    
                     ref_coord = SkyCoord(hdr["CRVAL1"] * u.deg, hdr["CRVAL2"] * u.deg)
 
                     df_cat = select_local_catalogue(df_cat_full, ref_coord)
@@ -470,9 +564,13 @@ def main():
                         print("No catalogue stars nearby -> skipping")
                         continue
 
-                    image = collapse_cube(cube)
+                    image, wave_idx = collapse_cube(              # now returns two objects
+                        cube=cube,
+                        wcs_spectral=wcs_spectral,
+                        edge_trim_fraction=0.08, # EDGE_TRIM_FRACTION in astrometry correction .py
+                    )
 
-                    matcher = InteractiveMatcher(image, wcs, df_cat)
+                    matcher = InteractiveMatcher(image, wcs, df_cat, title_info=title_info)
                     matcher.run()
 
                     if matcher.rejected:
@@ -537,6 +635,7 @@ def main():
                         clicked_cat=matcher.clicked_cat,
                         matched_index=int(idx),
                         output_path=out_plot,
+                        title_info=title_info,
                     )
                     print(f"Saved manual check plot: {out_plot}")
 
