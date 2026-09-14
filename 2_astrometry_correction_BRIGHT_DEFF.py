@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KMOS astrometric recentering from scratch (multi-concatenation version).
+KMOS astrometric recentering from scratch (multi-concatenation, parallel version).
 
 Philosophy
 ----------
@@ -21,6 +21,21 @@ Philosophy
 9. Keep the best valid solution, update the WCS of the original cube and of the
    collapsed image, save both, and create a visual check plot.
 
+Parallelisation
+---------------
+- OBs are fully independent (own input dir, own output dirs), so they are the
+  natural parallelisation unit.
+- A ProcessPoolExecutor is used. The catalogue FITS file is loaded once per
+  worker through an initializer, so it is not re-pickled for every task.
+- Matplotlib is forced to the non-interactive "Agg" backend before pyplot is
+  imported; otherwise forked/spawned workers may try to use an interactive
+  backend and crash.
+- The number of workers is chosen conservatively so the script is safe on a
+  shared server: it respects an explicit env override, then scheduler-provided
+  CPU counts (SLURM/PBS/SGE), then the actual CPU affinity of the process, and
+  only then falls back to a small default. os.cpu_count() is deliberately NOT
+  used because it reports the whole node, not the user's allocation.
+
 Notes
 -----
 - The local catalogue radius is controlled by CATALOGUE_SEARCH_RADIUS_ARCSEC.
@@ -34,10 +49,17 @@ Author: (your name)
 """
 
 import datetime
+import os
 import traceback
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
+
+# IMPORTANT: force a non-interactive backend BEFORE importing pyplot.
+# Required when using ProcessPoolExecutor / multiprocessing.
+import matplotlib
+matplotlib.use("Agg")
 
 import astropy.units as u
 import matplotlib.pyplot as plt
@@ -51,56 +73,83 @@ from astropy.wcs.utils import proj_plane_pixel_scales
 from photutils.aperture import CircularAperture
 from photutils.detection import DAOStarFinder
 
+
 # =============================================================================
-# CONFIGURATION – Edit only these variables
+# CONFIGURATION - Edit only these variables
 # =============================================================================
-pointing = "P0"                     # pointing name
-CONS = ["con1"]#, "con2", "con3", "con4", "con5", "con6"]     # concatenations to process
+pointing = "PX"                     # pointing name
+CONS = ["con3"]     # concatenations to process
 
 # Catalogue path (no extra spaces)
-GNS_TXT_PATH = Path("/home/data/KMOS/PILOT/GNS_cat/FINAL_EAST_CENTRAL_WEST_VIRAC.fits")
+GNS_TXT_PATH = Path("/home/jmgavilan/Desktop/KMOS/GNS_VIRAC_cat/FINAL_EAST_CENTRAL_WEST_VIRAC.fits")
 
-# Template for building the base directory of each OB.
-# {pointing}, {con_name} and {ob_name} will be replaced.
-BASE_DIR_TEMPLATE = ("/home/data/KMOS/PILOT/reduced/P113/{pointing}/{con_name}/{ob_name}/sky_tweak/")
-
-# =============================================================================
-# Auxiliary functions
-# =============================================================================
-def ensure_dir(path: Path) -> None:
-    """Create directory if it does not exist."""
-    path.mkdir(parents=True, exist_ok=True)
+# Template for the sky_tweak directory of each OB.
+# Must match the automatic pipeline structure.
+BASE_DIR_TEMPLATE = (
+    # "/home/data/KMOS/PILOT/reduced/P113/{pointing}/{con_name}/{ob_name}/sky_tweak/" # Server Path
+    "/home/jmgavilan/Desktop/PX/{pointing}/{con_name}/{ob_name}/sky_tweak/"  # Local test     # Local test
+)
 
 
-def get_ob_paths(ob_name: str) -> dict:
+
+# -------------------------------------------------------------------------
+# Safe worker-count detection for shared / HPC machines
+# -------------------------------------------------------------------------
+def _detect_safe_n_workers(default_fallback: int = 4) -> int:
     """
-    Build all paths for an OB using the global variable BASE_DIR.
+    Decide a safe number of worker processes on a shared / HPC machine.
+
+    Priority order
+    --------------
+    1. Explicit user override via the KMOS_N_WORKERS environment variable.
+    2. Scheduler-provided CPU counts:
+           - SLURM_CPUS_PER_TASK (Slurm)
+           - PBS_NP                (PBS/Torque)
+           - NSLOTS                (SGE)
+    3. CPU affinity of the current process (Linux cgroups / taskset / containers).
+    4. Conservative fallback (default_fallback), NEVER os.cpu_count().
+
+    Rationale
+    ---------
+    os.cpu_count() reports the physical cores of the whole node, which is
+    meaningless on a shared server. Using it would spawn far more workers than
+    the user is actually allowed to use, starving colleagues and the OS.
     """
-    ob_dir = BASE_DIR / f"res_{ob_name}"
+    # 1) Explicit user override
+    env_override = os.environ.get("KMOS_N_WORKERS")
+    if env_override:
+        try:
+            n = int(env_override)
+            if n >= 1:
+                return n
+        except ValueError:
+            pass
 
-    paths = {
-        "NAME": ob_name,
-        "OB_DIR": ob_dir,
-        "IFU_ROOT": BASE_DIR,
-        "COLLAPSED_OUTPUT": ob_dir / f"{ob_name}_collapsed_new",
-        "CORRECTED_CUBE_OUTPUT": ob_dir / "corrected_fits_new",
-        "CORRECTED_COLLAPSED_OUTPUT": ob_dir / "corrected_fits_new" / "collapsed",
-        "CHECK_PLOT_OUTPUT": ob_dir / "corrected_fits_new" / "visual_checks",
-        "DIAGNOSTIC_PLOT_OUTPUT": ob_dir / "corrected_fits_new" / "diagnostic_plots",
-        "FINAL_CHECK_PLOT_OUTPUT": ob_dir / "corrected_fits_new" / "final_check_plots",
-    }
+    # 2) Scheduler-provided allocation
+    for var in ("SLURM_CPUS_PER_TASK", "PBS_NP", "NSLOTS"):
+        val = os.environ.get(var)
+        if val:
+            try:
+                n = int(val)
+                if n >= 1:
+                    return n
+            except ValueError:
+                pass
 
-    for key in [
-        "COLLAPSED_OUTPUT",
-        "CORRECTED_CUBE_OUTPUT",
-        "CORRECTED_COLLAPSED_OUTPUT",
-        "CHECK_PLOT_OUTPUT",
-        "DIAGNOSTIC_PLOT_OUTPUT",
-        "FINAL_CHECK_PLOT_OUTPUT",
-    ]:
-        ensure_dir(paths[key])
+    # 3) Actual CPU affinity of this process (respects cgroups / taskset)
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            n = len(os.sched_getaffinity(0))
+            if n >= 1:
+                return n
+        except OSError:
+            pass
 
-    return paths
+    # 4) Conservative fallback for shared machines
+    return default_fallback
+
+
+N_WORKERS = _detect_safe_n_workers(default_fallback=4)
 
 
 # -------------------------------------------------------------------------
@@ -123,6 +172,45 @@ BRIGHT_ANCHOR_MAG_RANGE = 3
 EDGE_EXCLUSION_PIXELS = 1
 brightest_k_tolerance_mag = 0.75
 MIN_RMS_IMPROVEMENT_ARCSEC = 0.01
+
+
+# =============================================================================
+# Auxiliary functions
+# =============================================================================
+def ensure_dir(path: Path) -> None:
+    """Create directory if it does not exist."""
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def get_ob_paths(ob_name: str, base_dir: Path) -> dict:
+    """
+    Build all output paths for an OB given its sky_tweak base directory.
+    """
+    ob_dir = base_dir / f"res_{ob_name}"
+
+    paths = {
+        "NAME": ob_name,
+        "OB_DIR": ob_dir,
+        "IFU_ROOT": base_dir,
+        "COLLAPSED_OUTPUT": ob_dir / f"{ob_name}_collapsed_new",
+        "CORRECTED_CUBE_OUTPUT": ob_dir / "corrected_fits_new",
+        "CORRECTED_COLLAPSED_OUTPUT": ob_dir / "corrected_fits_new" / "collapsed",
+        "CHECK_PLOT_OUTPUT": ob_dir / "corrected_fits_new" / "visual_checks",
+        "DIAGNOSTIC_PLOT_OUTPUT": ob_dir / "corrected_fits_new" / "diagnostic_plots",
+        "FINAL_CHECK_PLOT_OUTPUT": ob_dir / "corrected_fits_new" / "final_check_plots",
+    }
+
+    for key in [
+        "COLLAPSED_OUTPUT",
+        "CORRECTED_CUBE_OUTPUT",
+        "CORRECTED_COLLAPSED_OUTPUT",
+        "CHECK_PLOT_OUTPUT",
+        "DIAGNOSTIC_PLOT_OUTPUT",
+        "FINAL_CHECK_PLOT_OUTPUT",
+    ]:
+        ensure_dir(paths[key])
+
+    return paths
 
 
 # =============================================================================
@@ -153,7 +241,7 @@ def filter_edge_sources(
 
     df_filtered = df_det.loc[mask].copy().reset_index(drop=True)
 
-    print(f"  Edge filtering: {len(df_det)} → {len(df_filtered)} detections (border={b}px)")
+    print(f"  Edge filtering: {len(df_det)} -> {len(df_filtered)} detections (border={b}px)")
 
     return df_filtered
 
@@ -492,10 +580,12 @@ def robust_psf_fwhm_arcsec_from_headers(
 
     return adopted, info
 
+
 def read_catalogue_fits(path: Path) -> pd.DataFrame:
     """
     Read catalogue from a FITS binary table.
-    Expected columns: RA, Dec, and a magnitude (preferentially K, but can be named Kmag, KMAG, etc.)
+    Expected columns: RA, Dec, and a magnitude (preferentially K, but can be
+    named Kmag, KMAG, etc.)
     """
     with fits.open(path) as hdul:
         # Find first table HDU
@@ -506,10 +596,10 @@ def read_catalogue_fits(path: Path) -> pd.DataFrame:
                 break
         if table_hdu is None:
             raise ValueError("No table HDU found in catalogue FITS file.")
-        
+
         data = table_hdu.data
         columns = [col.name.lower() for col in table_hdu.columns]
-        
+
         # Identify RA column
         ra_col = None
         for possible in ['ra', 'raj2000', 'ra_deg', 'alpha']:
@@ -518,7 +608,7 @@ def read_catalogue_fits(path: Path) -> pd.DataFrame:
                 break
         if ra_col is None:
             raise ValueError(f"Cannot find RA column. Available columns: {columns}")
-        
+
         # Identify Dec column
         dec_col = None
         for possible in ['dec', 'dej2000', 'dec_deg', 'delta']:
@@ -527,7 +617,7 @@ def read_catalogue_fits(path: Path) -> pd.DataFrame:
                 break
         if dec_col is None:
             raise ValueError(f"Cannot find Dec column. Available columns: {columns}")
-        
+
         # Identify magnitude column (prefer K)
         mag_col = None
         for possible in ['k', 'kmag', 'k_mag', 'mag_k', 'ks', 'ksmag']:
@@ -535,20 +625,20 @@ def read_catalogue_fits(path: Path) -> pd.DataFrame:
                 mag_col = possible
                 break
         if mag_col is None:
-            # fallback to any column containing 'mag'
+            # Fallback to any column containing 'mag'
             mag_candidates = [c for c in columns if 'mag' in c]
             if mag_candidates:
                 mag_col = mag_candidates[0]  # take first
             else:
                 raise ValueError(f"Cannot find magnitude column. Available columns: {columns}")
-        
+
         # Build DataFrame with standard names
         df = pd.DataFrame({
             'ra_deg': data[ra_col].astype(float),
             'dec_deg': data[dec_col].astype(float),
             'K': data[mag_col].astype(float)
         })
-        
+
         # Filter valid entries
         good = (
             np.isfinite(df['ra_deg'].to_numpy()) &
@@ -556,7 +646,8 @@ def read_catalogue_fits(path: Path) -> pd.DataFrame:
             np.isfinite(df['K'].to_numpy())
         )
         return df.loc[good].copy().reset_index(drop=True)
-    
+
+
 def read_catalogue_txt(path: Path) -> pd.DataFrame:
     """
     Read GNUCLEUS/GNS plain text catalogue with columns:
@@ -738,7 +829,7 @@ def detect_sources_in_image(
         print("  Accepted PSF indicators:")
         for name, val in psf_info["ACCEPTED_CANDIDATES"]:
             print(f"    - {name}: {val:.3f}\"")
-    
+
     if len(psf_info.get("REJECTED_CANDIDATES", [])) > 0:
         print("  Rejected PSF indicators:")
         for name, val, reason in psf_info["REJECTED_CANDIDATES"]:
@@ -746,8 +837,7 @@ def detect_sources_in_image(
                 print(f"    - {name}: [{reason}]")
             else:
                 print(f"    - {name}: {val:.3f}\" [{reason}]")
-                
-                
+
     if sources is None or len(sources) == 0:
         return pd.DataFrame(columns=["x_pix", "y_pix", "ra_deg", "dec_deg", "flux"])
 
@@ -839,10 +929,10 @@ def evaluate_shift_candidate(
     Evaluate one shift by mutual nearest-neighbour matching.
     Returns a dictionary with success/failure information.
 
-    New strict photometric logic
-    ----------------------------
+    Photometric logic
+    -----------------
     1. Keep the geometric conditions.
-    2. Re-enable global flux-magnitude consistency.
+    2. Enforce global flux-magnitude consistency.
     3. Explicitly reject solutions where the brightest KMOS source is matched to
        a catalogue star that is significantly fainter than catalogue stars
        matched to weaker KMOS detections.
@@ -923,7 +1013,7 @@ def evaluate_shift_candidate(
             return result
 
     # ---------------------------------------------------------
-    # Re-enable global flux-magnitude consistency
+    # Global flux-magnitude consistency
     # ---------------------------------------------------------
     if nmatch >= 2:
         ok_flux = is_flux_magnitude_consistent(
@@ -966,8 +1056,8 @@ def solve_astrometry_for_ifu(
     """
     Solve astrometry by trying different detected KMOS anchor stars.
 
-    New logic
-    ---------
+    Logic
+    -----
     1. Order detected KMOS stars by distance to the IFU reference position.
        This makes the likely target come first.
     2. For each chosen detected anchor:
@@ -1100,7 +1190,7 @@ def solve_astrometry_for_ifu(
                 min_nmatch=min_nmatch,
                 min_match_fraction=min_match_fraction,
                 flux_tolerance_ratio=flux_tolerance_ratio,
-                require_brightest_match=True,  # important
+                require_brightest_match=True,
             )
 
             candidate["anchor_cat_rank"] = i_cat + 1
@@ -1172,9 +1262,9 @@ def solve_astrometry_for_ifu(
         else:
             rms_zero = candidate_zero.get("rms_arcsec", np.inf)
             rms_best = best.get("rms_arcsec", np.inf)
-    
+
             improvement = rms_zero - rms_best
-    
+
             # Keep zero shift only if it is truly comparable or better
             if (
                 candidate_zero["nmatch"] > best["nmatch"]
@@ -1185,12 +1275,12 @@ def solve_astrometry_for_ifu(
             ):
                 print(
                     "  Zero-shift solution retained "
-                    f"(ΔRMS={improvement:.3f}\", "
+                    f"(Delta RMS={improvement:.3f}\", "
                     f"Nmatch zero={candidate_zero['nmatch']}, "
                     f"Nmatch shifted={best['nmatch']})."
                 )
                 best = candidate_zero.copy()
-                
+
     df_debug = pd.DataFrame(debug_rows)
 
     if verbose and len(df_debug) > 0:
@@ -1526,10 +1616,14 @@ def make_trial_summary_plot(
 # =============================================================================
 # Main OB processing function
 # =============================================================================
-def run_one_ob(ob_name: str, df_catalogue: pd.DataFrame) -> None:
-    print_header(f"START KMOS ASTROMETRY FOR {ob_name}")
+def run_one_ob(ob_name: str, base_dir: Path, df_catalogue: pd.DataFrame) -> list:
+    """
+    Process a single OB and return a list of summary dicts (one per IFU).
+    This function is safe to call inside a worker process.
+    """
+    print_header(f"START KMOS ASTROMETRY FOR {ob_name} (base_dir={base_dir})")
 
-    paths = get_ob_paths(ob_name)
+    paths = get_ob_paths(ob_name, base_dir)
 
     NAME = paths["NAME"]
     OB_DIR = paths["OB_DIR"]
@@ -1544,7 +1638,7 @@ def run_one_ob(ob_name: str, df_catalogue: pd.DataFrame) -> None:
     fits_files = sorted(IFU_ROOT.glob(INPUT_PATTERN))
     if len(fits_files) == 0:
         print(f"No FITS files found in {IFU_ROOT} with pattern {INPUT_PATTERN}")
-        return
+        return []
 
     print(f"IFU cubes found in {ob_name}: {len(fits_files)}")
 
@@ -1734,6 +1828,7 @@ def run_one_ob(ob_name: str, df_catalogue: pd.DataFrame) -> None:
                     )
 
                 summary_rows.append({
+                    "ob_name": ob_name,
                     "input_file": fits_path.name,
                     "n_detected": len(df_det),
                     "n_cat_local": len(df_local_cat),
@@ -1765,23 +1860,50 @@ def run_one_ob(ob_name: str, df_catalogue: pd.DataFrame) -> None:
         print_header(f"PIPELINE SUMMARY FOR {ob_name}")
         print("No IFUs were successfully corrected.")
 
+    return summary_rows
+
+
+# =============================================================================
+# Worker-side globals (populated by the pool initializer)
+# =============================================================================
+_WORKER_CATALOGUE: Optional[pd.DataFrame] = None
+
+
+def _init_worker(catalogue_path_str: str) -> None:
+    """
+    Load the catalogue once per worker process.
+    This avoids re-pickling a large DataFrame for every OB task.
+    """
+    global _WORKER_CATALOGUE
+    _WORKER_CATALOGUE = read_catalogue_fits(Path(catalogue_path_str))
+
+
+def _process_ob_task(ob_name: str, base_dir_str: str) -> list:
+    """
+    Thin wrapper that runs run_one_ob using the worker-local catalogue.
+    Returns the summary rows so the parent process can aggregate them.
+    """
+    assert _WORKER_CATALOGUE is not None, "Worker catalogue was not initialised."
+    return run_one_ob(ob_name, Path(base_dir_str), _WORKER_CATALOGUE)
+
 
 # =============================================================================
 # Main function: loops over concatenations and discovers OB subdirectories
 # =============================================================================
 def main() -> None:
-    global BASE_DIR
-    print_header("START MULTI-CONCATENATION KMOS ASTROMETRY")
+    print_header("START MULTI-CONCATENATION KMOS ASTROMETRY (PARALLEL)")
+    print(f"Workers: {N_WORKERS}")
+    print("  (override with:  KMOS_N_WORKERS=N python3 this_script.py)")
 
-    df_catalogue = read_catalogue_fits(GNS_TXT_PATH)   # ahora es FITS, pero variable mantiene nombre
-    print(f"Catalogue loaded: {len(df_catalogue)} sources")
+    # -----------------------------------------------------------------
+    # 1) Discover all (ob_name, sky_tweak_dir) tasks in the parent
+    #    process. This makes path errors visible before spawning workers.
+    # -----------------------------------------------------------------
+    tasks: list[tuple[str, Path]] = []
 
     for con_name in CONS:
-        print_header(f"PROCESSING CONCATENATION: {con_name}")
+        print_header(f"DISCOVERING OBs FOR CONCATENATION: {con_name}")
 
-        # Use a dummy OB name to derive the directory containing the OB folders.
-        # The template ends with .../{ob_name}/sky_tweak/.
-        # Going up two levels gives .../{con_name}/
         dummy_sky = Path(BASE_DIR_TEMPLATE.format(
             pointing=pointing, con_name=con_name, ob_name="dummy"
         ))
@@ -1804,20 +1926,65 @@ def main() -> None:
 
         for ob_dir in ob_dirs:
             ob_name = ob_dir.name
-            # Build the exact sky_tweak path for this OB using the template
-            BASE_DIR = Path(BASE_DIR_TEMPLATE.format(
+            base_dir = Path(BASE_DIR_TEMPLATE.format(
                 pointing=pointing, con_name=con_name, ob_name=ob_name
             ))
-            if not BASE_DIR.exists():
+            if not base_dir.exists():
                 print(f"  WARNING: sky_tweak folder missing for {ob_name}, skipping")
                 continue
+            tasks.append((ob_name, base_dir))
 
+    if not tasks:
+        print_header("NO TASKS TO RUN")
+        return
+
+    print_header(f"TOTAL OBs TO PROCESS: {len(tasks)}")
+
+    # -----------------------------------------------------------------
+    # 2) Execute tasks in parallel.
+    #    The catalogue is loaded once per worker via the initializer.
+    # -----------------------------------------------------------------
+    all_summary_rows: list[dict] = []
+    failed_tasks: list[tuple[str, str]] = []
+
+    with ProcessPoolExecutor(
+        max_workers=N_WORKERS,
+        initializer=_init_worker,
+        initargs=(str(GNS_TXT_PATH),),
+    ) as executor:
+        futures = {
+            executor.submit(_process_ob_task, ob_name, str(base_dir)): (ob_name, base_dir)
+            for ob_name, base_dir in tasks
+        }
+
+        for future in as_completed(futures):
+            ob_name, base_dir = futures[future]
             try:
-                run_one_ob(ob_name, df_catalogue)
+                rows = future.result()
+                if rows:
+                    all_summary_rows.extend(rows)
+                print(f"[DONE] {ob_name}")
             except Exception as exc:
-                print_header(f"FATAL ERROR IN {con_name}/{ob_name}")
+                print_header(f"FATAL ERROR IN {ob_name}")
                 print(exc)
                 traceback.print_exc()
+                failed_tasks.append((ob_name, str(exc)))
+
+    # -----------------------------------------------------------------
+    # 3) Write a global summary across all OBs.
+    # -----------------------------------------------------------------
+    if all_summary_rows:
+        df_all = pd.DataFrame(all_summary_rows)
+        global_summary_path = GNS_TXT_PATH.parent / "global_astrometry_summary.csv"
+        df_all.to_csv(global_summary_path, index=False)
+        print_header("GLOBAL PIPELINE SUMMARY")
+        print(df_all.to_string(index=False))
+        print(f"\nGlobal summary saved to: {global_summary_path}")
+
+    if failed_tasks:
+        print_header("TASKS THAT FAILED")
+        for name, err in failed_tasks:
+            print(f"  - {name}: {err}")
 
     print_header("ALL CONCATENATIONS FINISHED")
 
