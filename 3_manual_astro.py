@@ -49,8 +49,8 @@ from astropy.wcs import WCS
 # ============================================================
 # CONFIGURATION – Edit only these variables
 # ============================================================
-pointing = "P0"                     # pointing name
-CONS = ["con1"]     # concatenations to process
+pointing = "PX"                     # pointing name
+CONS = ["conx"]     # concatenations to process
 
 INPUT_PATTERN = "COMBINE_SKY_TWEAK_*.fits"
 
@@ -64,8 +64,12 @@ REFERENCE_K_LIMIT = 14.5
 # Template for the sky_tweak directory of each OB.
 # Must match the automatic pipeline structure.
 BASE_DIR_TEMPLATE = (
-    "/home/data/KMOS/PILOT/reduced/P113/{pointing}/{con_name}/{ob_name}/sky_tweak/"
+    # "/home/data/KMOS/PILOT/reduced/P113/{pointing}/{con_name}/{ob_name}/sky_tweak/" # Server Path
+    "/home/jmgavilan/Desktop/PX/{pointing}/{con_name}/OBX/sky_tweak/"     # Local test
 )
+
+# "/home/data/KMOS/PILOT/reduced/P113/{pointing}/{con_name}/{ob_name}/sky_tweak/" # Server Path
+
 BASE_DIR = None   # will be updated for each OB
 
 # ============================================================
@@ -275,7 +279,10 @@ def save_manual_check_plot(
         vmin, vmax = np.nanpercentile(finite, [5, 99])
     else:
         vmin, vmax = None, None
-    ax.imshow(image, origin="lower", cmap="hot", vmin=vmin, vmax=vmax)
+    im = ax.imshow(image, origin="lower", cmap="hot", vmin=vmin, vmax=vmax)
+    cbar = fig.colorbar(im, ax=ax, pad=0.02, shrink=0.95)
+    cbar.set_label("Collapsed flux")
+    
     coords = SkyCoord(df_cat["ra"].values * u.deg, df_cat["dec"].values * u.deg)
     x_cat, y_cat = wcs.world_to_pixel(coords)
     ax.scatter(x_cat, y_cat, color="cyan", marker="x", s=60)
@@ -320,7 +327,10 @@ class InteractiveMatcher:
             vmin, vmax = np.nanpercentile(finite, [5, 99])
         else:
             vmin, vmax = None, None
-        self.ax.imshow(self.image, origin="lower", cmap="hot", vmin=vmin, vmax=vmax)
+        im = self.ax.imshow(self.image, origin="lower", cmap="hot", vmin=vmin, vmax=vmax)
+        cbar = self.fig.colorbar(im, ax=self.ax,  pad=0.02, shrink=0.95)
+        cbar.set_label("Collapsed flux")
+        
         coords = SkyCoord(self.df_cat["ra"].values * u.deg, self.df_cat["dec"].values * u.deg)
         x, y = self.wcs.world_to_pixel(coords)
         self.ax.scatter(x, y, color="cyan", marker="x", s=60)
